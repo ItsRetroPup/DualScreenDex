@@ -536,6 +536,22 @@ class CatalogStoreTest {
     }
 
     @Test
+    fun revision92CachesWithTheUnsignedLiveClockRootAreRejectedAndCurrentReopens() {
+        val root = newRoot().toFile()
+        val cache = CatalogCache(root, JdbcCatalogDatabaseFactory)
+        val catalog = completeCatalog("9".repeat(64))
+        val source = CatalogSourceMetadata.direct("Synthetic.gba", 65536, "SYNTHETIC")
+        cache.write(catalog, source, CatalogWriteProgress.complete())
+        JdbcCatalogDatabaseFactory.open(cache.fileFor(catalog.romSha256)).use { database ->
+            database.execute("UPDATE catalog_metadata SET parser_schema_version = 92 WHERE id = 1")
+            assertNull(CatalogReader(database).readComplete())
+        }
+        cache.write(catalog, source, CatalogWriteProgress.complete())
+        assertEquals(catalog, requireNotNull(CatalogCache(root, JdbcCatalogDatabaseFactory).readComplete(catalog.romSha256)).catalog)
+        assertTrue(CatalogSchema.parserSchemaVersion > 92)
+    }
+
+    @Test
     fun revision82CachesBeforeCompiledCoreExpansionAreRejectedAndCurrentReopens() {
         val root = newRoot().toFile()
         val cache = CatalogCache(root, JdbcCatalogDatabaseFactory)
@@ -3242,6 +3258,7 @@ class CatalogStoreTest {
         val localizedMaps = mapOf(
             LocalizedTextCapability.SPECIES_NAMES to prior.speciesNames,
             LocalizedTextCapability.SPECIES_DESCRIPTIONS to prior.speciesDescriptions,
+            LocalizedTextCapability.SPECIES_CATEGORIES to prior.speciesCategories,
             LocalizedTextCapability.MOVE_NAMES to prior.moveNames,
             LocalizedTextCapability.MOVE_DESCRIPTIONS to prior.moveDescriptions,
             LocalizedTextCapability.ABILITY_NAMES to prior.abilityNames,
@@ -3260,6 +3277,11 @@ class CatalogStoreTest {
             LocalizedTextCapability.SPECIES_NAMES to base.speciesById.size,
             LocalizedTextCapability.SPECIES_DESCRIPTIONS to base.speciesById.count { (id, record) ->
                 id > 0 && record.dexNumber.status != CapabilityStatus.NOT_APPLICABLE
+            },
+            LocalizedTextCapability.SPECIES_CATEGORIES to base.speciesById.count { (id, record) ->
+                id > 0 && record.dexNumber.status != CapabilityStatus.NOT_APPLICABLE &&
+                    record.description.status != CapabilityStatus.NOT_APPLICABLE &&
+                    record.category.status != CapabilityStatus.NOT_APPLICABLE
             },
             LocalizedTextCapability.MOVE_NAMES to base.movesById.size,
             LocalizedTextCapability.MOVE_DESCRIPTIONS to base.movesById.keys.count { it > 0 },
@@ -3296,6 +3318,7 @@ class CatalogStoreTest {
             localizedCapabilities = capabilities,
             speciesNames = prior.speciesNames,
             speciesDescriptions = prior.speciesDescriptions,
+            speciesCategories = prior.speciesCategories,
             moveNames = prior.moveNames,
             moveDescriptions = prior.moveDescriptions,
             abilityNames = prior.abilityNames,
@@ -3422,7 +3445,9 @@ class CatalogStoreTest {
             overlayVersion = 1,
             localizedCapabilities = LocalizedTextCapability.entries.associateWith { capability ->
                 val expected = localizedExpectedRecords[capability] ?: 0
-                if (expected == 0) {
+                if (capability == LocalizedTextCapability.SPECIES_CATEGORIES) {
+                    LocalizedCapabilityState.notFound("category not part of this fixture", 1)
+                } else if (expected == 0) {
                     LocalizedCapabilityState.notApplicable("empty fixture domain")
                 } else {
                     LocalizedCapabilityState.available(expected)

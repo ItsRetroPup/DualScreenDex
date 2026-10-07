@@ -380,6 +380,7 @@ object CatalogMaterializer {
         }
         cancellation.throwIfCancellationRequested()
         val descriptions = descriptionMaterialization.records
+        val categories = SpeciesCategoryMaterializer.materialize(rom, layout, cancellation)
         val sprites = SpriteMaterializer.pokemon(rom, layout, cancellation = cancellation)
         val resolvedSprites = resolveSpriteAliases(baseSpecies, sprites, layout.generation)
         val mediaSpecies = baseSpecies.mapValues { (id, record) ->
@@ -401,6 +402,11 @@ object CatalogMaterializer {
                     !pokedexApplicable -> CatalogField.notApplicable("species is outside the ROM's compiled description-table domain")
                     description?.text != null -> CatalogField.available(description.text)
                     else -> CatalogField.notFound("description could not be decoded for species $id")
+                },
+                category = when {
+                    !pokedexApplicable -> CatalogField.notApplicable("species is outside the ROM's compiled description-table domain")
+                    categories[descriptionKey] != null -> CatalogField.available(categories.getValue(requireNotNull(descriptionKey)))
+                    else -> CatalogField.notFound("species category could not be validated for species $id")
                 },
                 height = when {
                     !pokedexApplicable -> CatalogField.notApplicable("species is outside the ROM's compiled description-table domain")
@@ -1042,10 +1048,31 @@ object CatalogMaterializer {
         worldMaps.assets.toSortedMap().values.toList()
             .takeIf { it.isNotEmpty() }
             ?.let { put(CatalogThemeAssetClass.WORLD_MAP, it) }
-        localMaps.assets.toSortedMap().values.mapNotNull { asset ->
-            runCatching { decodeNormalizedPng(asset.bytes) }.getOrNull()
-        }.takeIf { it.isNotEmpty() }
+        themeLocalMapSprites(localMaps)
+            .takeIf { it.isNotEmpty() }
             ?.let { put(CatalogThemeAssetClass.LOCAL_MAP, it) }
+    }
+
+    /**
+     * Decodes local-map PNGs one at a time and keeps only the sprites the theme will actually sample.
+     *
+     * RomThemeMaterializer keeps the [RomThemeMaterializer.MAX_ASSETS_PER_CLASS] distinct sprites with the
+     * lowest fingerprints, so retaining every decoded map first (hundreds of ~1 MiB pixel arrays for a
+     * full Gen III region) only exhausts the heap without changing the chosen theme.
+     */
+    private fun themeLocalMapSprites(localMaps: LocalMapCatalog): List<RgbaSprite> {
+        val selected = java.util.TreeMap<Long, RgbaSprite>()
+        localMaps.assets.toSortedMap().values.forEach { asset ->
+            val sprite = runCatching { decodeNormalizedPng(asset.bytes) }.getOrNull() ?: return@forEach
+            val fingerprint = RomThemeMaterializer.assetFingerprint(sprite)
+            if (fingerprint in selected) return@forEach
+            if (selected.size == RomThemeMaterializer.MAX_ASSETS_PER_CLASS) {
+                if (fingerprint >= selected.lastKey()) return@forEach
+                selected.pollLastEntry()
+            }
+            selected[fingerprint] = sprite
+        }
+        return selected.values.toList()
     }
 
     private fun decodeNormalizedPng(bytes: ByteArray): RgbaSprite {

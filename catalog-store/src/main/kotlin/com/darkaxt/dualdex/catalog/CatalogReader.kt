@@ -44,7 +44,10 @@ import com.enrpau.dualscreendex.parser.model.TableLayout
 import com.enrpau.dualscreendex.parser.dataset.natures.NatureRecord
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
+import com.google.gson.TypeAdapter
 import com.google.gson.reflect.TypeToken
+import com.google.gson.stream.JsonReader
+import com.google.gson.stream.JsonWriter
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.FilterInputStream
@@ -694,6 +697,7 @@ private data class StoredCatalogLanguageOverlay(
     val localizedCapabilities: List<StoredLocalizedCapabilityState?>? = null,
     val speciesNames: Map<Int, CatalogField<String>?>? = null,
     val speciesDescriptions: Map<Int, CatalogField<String>?>? = null,
+    val speciesCategories: Map<Int, CatalogField<String>?>? = null,
     val moveNames: Map<Int, CatalogField<String>?>? = null,
     val moveDescriptions: Map<Int, CatalogField<String>?>? = null,
     val abilityNames: Map<Int, CatalogField<String>?>? = null,
@@ -735,6 +739,7 @@ private data class StoredCatalogLanguageOverlay(
             localizedCapabilities = storedCapabilities.toMap(linkedMapOf()),
             speciesNames = speciesNames.requiredTextMap("species names"),
             speciesDescriptions = speciesDescriptions.requiredTextMap("species descriptions"),
+            speciesCategories = speciesCategories.requiredTextMap("species categories"),
             moveNames = moveNames.requiredTextMap("move names"),
             moveDescriptions = moveDescriptions.requiredTextMap("move descriptions"),
             abilityNames = abilityNames.requiredTextMap("ability names"),
@@ -763,6 +768,7 @@ private data class StoredCatalogLanguageOverlay(
             },
             speciesNames = value.speciesNames,
             speciesDescriptions = value.speciesDescriptions,
+            speciesCategories = value.speciesCategories,
             moveNames = value.moveNames,
             moveDescriptions = value.moveDescriptions,
             abilityNames = value.abilityNames,
@@ -788,7 +794,12 @@ private fun <K> Map<K, CatalogField<String>?>?.requiredTextMap(label: String): M
     }
 
 internal class CatalogSectionCodec {
-    private val gson: Gson = GsonBuilder().serializeNulls().create()
+    // Gson writes ByteArray as a JSON number list (~3.5 characters per byte). Local-map PNGs for a full
+    // Gen III region reach ~10 MiB, which became ~32 MiB of JSON that was encoded twice per first load.
+    private val gson: Gson = GsonBuilder()
+        .serializeNulls()
+        .registerTypeAdapter(ByteArray::class.java, Base64ByteArrayAdapter.nullSafe())
+        .create()
     private val speciesType = type<Map<Int, SpeciesRecord>>()
     private val movesType = type<Map<Int, MoveRecord>>()
     private val typesType = type<Map<Int, TypeRecord>>()
@@ -923,12 +934,25 @@ internal class CatalogSectionCodec {
                 val windows = runCatching { area.windows }.getOrNull()
                 if (windows.isNullOrEmpty()) area.copy(windows = setOf(EncounterWindow.ANY)) else area
             }
+        val species = decoded<Map<Int, SpeciesRecord>>("species", speciesType).mapValues { (_, record) ->
+            val category = requireNotNull(record.category) { "persisted species requires a category field" }
+            val checked = CatalogField(
+                requireNotNull(category.status) { "persisted species category requires a status" },
+                category.value,
+                requireNotNull(category.reasons) { "persisted species category requires reasons" },
+            )
+            val value = checked.value
+            require(value == null || value.isNotBlank() && value.length <= 4096) {
+                "persisted species category must be bounded and nonblank"
+            }
+            record.copy(category = checked)
+        }
         return ParsedCatalog(
             romSha256 = sha256,
             romCrc32 = crc32,
             family = family,
             platform = platform,
-            speciesById = decoded("species", speciesType),
+            speciesById = species,
             movesById = decoded("moves", movesType),
             typesById = decoded("types", typesType),
             abilitiesById = decoded("abilities", abilitiesType),
@@ -1141,3 +1165,12 @@ private fun CatalogRow.requiredString(column: String): String =
 
 private fun CatalogRow.requiredLong(column: String): Long =
     requireNotNull(long(column)) { "catalog column $column is null" }
+
+/** Stores binary payloads (local-map PNGs) as one Base64 string instead of a JSON number per byte. */
+private object Base64ByteArrayAdapter : TypeAdapter<ByteArray>() {
+    override fun write(out: JsonWriter, value: ByteArray) {
+        out.value(java.util.Base64.getEncoder().encodeToString(value))
+    }
+
+    override fun read(input: JsonReader): ByteArray = java.util.Base64.getDecoder().decode(input.nextString())
+}
